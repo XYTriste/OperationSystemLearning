@@ -104,7 +104,7 @@
 ### HellWorld
 在BIOS的工作完成之后，我们就可以开始尝试加载我们自己的操作系统了。这里我用的是WSL（Windows SubSystem Linux）环境下的NASM以及QEMU进行模拟。
 HelloWorld操作系统的代码如下：
-```asm
+```assembly
 [org 0x7c00]    ; 告诉编译器这段代码会被加载到 0x7c00
 
     ; --- 初始化 ---
@@ -164,7 +164,7 @@ HelloWorld操作系统的代码如下：
     - al 寄存器：要打印的字符的 ASCII 码。
 
 代码如下：
-```asm
+```assembly
 [org 0x7C00]
 
     mov ax, 0
@@ -217,7 +217,7 @@ loop_start:
 2. `je label (Jump if Equal)`：如果刚才比较的结果是相等，就跳转到 label 处执行。
 
 新的代码为：
-```asm
+```assembly
 [org 0x7C00]
 
     mov ax, 0
@@ -264,7 +264,7 @@ dw 0xaa55
 
 ### 让 OS“学会说话” (字符串与内存寻址)
 在这一示例中，我们添加代码来实现打开OS时，显示一行欢迎语句。
-```asm
+```assembly
 [org 0x7C00]
 
     mov ax, 0
@@ -347,12 +347,12 @@ dw 0xaa55
     SI++;
     ```
 在`print_string`中，我们还使用了一些小技巧。通常情况下，我们可以使用`cmp`来判断是否读到字符串结尾：
-```asm
+```assembly
 cmp al, 0
 je .done
 ```
 而寄存器是存在着若干个标志位的（有关标志位的内容后续了解），当我们使用：
-```asm
+```assembly
 or al, al
 jz .done
 ```
@@ -361,7 +361,7 @@ jz .done
 ### 读取并执行 Sector 2
 现在我们的任务是读取磁盘中的第二个扇区，我们已知扇区1（扇区编号从1开始，扇区1指引导扇区）从地址`0x7C00`开始，大小为512字节，那么也就是到`0x7DFF`结束正好结束。扇区2的开始地址为`0x7E00`，大小同样为512字节。
 由于我们的`times`命令实现了对于第一个扇区的填充，因此我们只要接着后面写代码，实际上在将其加载到内存中时，后面的代码就处于第二个扇区中。我们可以通过指定功能号(`0x02`)、读取数量(`1`)以及指定柱面、磁头、扇区号、驱动器号来指定要读取的扇区，最后调用`int 0x13`中断要求BIOS读取磁盘。完整代码如下：
-```asm
+```assembly
 [org 0x7C00]
 
     mov ax, 0
@@ -456,7 +456,7 @@ times 512 db 'A'
 
 ### 控制权的交接
 现在，我们的引导扇区的代码越来越膨胀了，也即将到达边缘。为了保证我们的操作系统能够正常运行，我们需要去执行扇区2的代码，为了达到这一目标，我们需要做的事为：读取第2个扇区，然后跳转到第2个扇区开始执行代码。因此我们修改我们的代码，完整如下：
-```asm
+```assembly
 [org 0x7C00]
 
     mov ax, 0
@@ -637,3 +637,564 @@ GDT 表中的每一行（称为一个 描述符 Descriptor）有 8 个字节（6
 - TI（表指示符）：0=GDT，1=LDT
 - RPL（请求特权级）：0-3
 
+> 注意到，由于段选择子中，用于索引的位数有13位，自然而然`GDT`表中能够描述的段的数量就是$2^13 = 8192$个了。
+
+在之前的代码中，我们新增了GDT表：
+```assembly
+[org 0x7C00]
+
+    mov ax, 0
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+
+    mov [boot_drive], dl
+    mov si, msg_loading
+    call print_string
+
+    mov bx, sector2_start
+
+    mov ah, 0x02
+    mov al, 1
+
+    mov ch, 0
+    mov dh, 0
+    mov cl, 2
+    mov dl, [boot_drive]
+    int 0x13
+
+    jc disk_error
+
+    jmp sector2_start
+    
+
+print_string:
+    .loop:
+        lodsb
+        or al, al
+        jz .done
+
+        mov ah, 0x0e
+        int 0x10
+        jmp .loop
+    .done:
+        ret
+
+loop_start:
+    mov ah, 0x00
+    int 0x16
+
+    cmp al, 0x0d
+    je handler_enter
+
+    cmp al, 0x08
+    je handler_backspace
+    
+    mov ah, 0x0e
+    int 0x10
+    jmp loop_start
+
+handler_enter:
+    mov ah, 0x0e
+    int 0x10
+    mov al, 0x0a
+    int 0x10
+
+    jmp loop_start
+
+handler_backspace:
+    mov ah, 0x0e
+    int 0x10
+    mov al, 0x20
+    int 0x10
+    mov al, 0x08
+    int 0x10
+    jmp loop_start
+
+disk_error:
+    mov si, msg_error
+    call print_string
+    jmp $
+
+msg_welcome db "Welcome to XYTriste OS!!!", 0x0d, 0x0a, 0
+boot_drive db 0
+msg_loading db "Loading...", 0x0d, 0x0a, 0
+msg_error db "Disk Error!", 0
+
+gdt_start:
+
+gdt_null:
+    dd 0x0
+    dd 0x0
+
+gdt_code:
+    dw 0xffff
+    dw 0x0000
+    db 0x00
+    db 0x9a
+    db 11001111b
+    db 0x00
+
+gdt_data:
+    dw 0xffff
+    dw 0x0000
+    db 0x00
+    db 0x90
+    db 11001111b
+    db 0x00
+
+gdt_end:
+
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1
+    dd gdt_start
+
+CODE_SEG equ gdt_code - gdt_start
+DATA_SEG equ gdt_data - gdt_start
+
+times 510-($-$$) db 0
+dw 0xaa55
+
+sector2_start:
+    mov si, msg_kernel_success
+    call print_string
+    jmp $
+
+msg_message_in_sector2 db "There is sector2!", 0x0d, 0x0a, 0
+msg_kernel_success db "Kernel Loaded Successfully! You are in Sector 2 now!", 0x0d, 0x0a, 0
+times 512-($-sector2_start) db 0
+```
+现在，在引导扇区的最后一部分（或者说代码段之后）我们新增了一张`GDT`表，该表中正如之前所说的，按**每8个字节**作为一个描述符描述段的大小。
+由于我们采用的是**平坦模式**，也就是整个内存空间都为一个段的设计，因此我们的段基址和段界限部分分别为**全0和全F**，而重点则是在`Access Byte(权限字节)`以及`Granularity Flags(粒度标志)`的部分，我们通过指定这部分来说明段的类型以及访问权限级别等关键内容。
+此外，我们还需要了解一个重要的事实:<font color="red">CS作为代码段的段选择子，在我们使用`jmp`等指令跳转到下一条指令位置时，CPU永远都会用CS来作为段选择子来索引`GDT`表，这样在索引过程中就可以了解到被索引项是否是一个代码段（通过权限字节）。而在我们使用`mov`这样的内存读写指令时,CPU会使用`ds、es、fs、gs、ss`等数据段段选择子作为索引项，从而在索引过程中判断被索引的是否是一个数据段。从而避免了对于段的误读写。</font>
+
+### 切换到保护模式
+接下来，我们要做的就是编写相应的代码，使得计算机从实模式切换到保护模式。在这之前，我们需要确定几个要做的工作：
+- 告诉CPU，接下来我们需要通过**段选择子：偏移地址**的形式来确定我们要访问的内存地址，这意味着我们需要一张`GDT`表，定义完`GDT`表以后，我们通过`lgdt`这一指令告诉CPU：GDT表的大小以及起始地址的位置。
+- 告诉CPU，我们需要切换到保护模式。这一切换是通过改变CPU内部的`CR0`控制寄存器的**第0位**来实现的，当这一位是0时，CPU处于实模式。而当我们将其切换到1时，则CPU会按照`GDT`的规则去完成相应的寻址操作。
+
+以下是修改后，读取第二个扇区并进入保护模式的代码：
+```assembly
+[org 0x7C00]
+
+    mov ax, 0
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+
+    mov [boot_drive], dl
+    mov si, msg_loading
+    call print_string
+
+    mov bx, sector2_start_32  ;调用约定，读扇区服务使用es:bx作为段:偏移读地址
+
+    mov ah, 0x02
+    mov al, 1
+
+    mov ch, 0
+    mov dh, 0
+    mov cl, 2
+    mov dl, [boot_drive]
+    int 0x13
+
+    jc disk_error
+
+    mov si, msg_read_ok
+    call print_string
+
+    cli
+    lgdt [gdt_descriptor]
+    
+    in al, 0x92
+    or al, 2
+    out 0x92, al
+    
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+
+    jmp CODE_SEG:init_pm
+
+print_string:
+    .loop:
+        lodsb
+        or al, al
+        jz .done
+
+        mov ah, 0x0e
+        int 0x10
+        jmp .loop
+    .done:
+        ret
+
+loop_start:
+    mov ah, 0x00
+    int 0x16
+
+    cmp al, 0x0d
+    je handler_enter
+
+    cmp al, 0x08
+    je handler_backspace
+    
+    mov ah, 0x0e
+    int 0x10
+    jmp loop_start
+
+handler_enter:
+    mov ah, 0x0e
+    int 0x10
+    mov al, 0x0a
+    int 0x10
+
+    jmp loop_start
+
+handler_backspace:
+    mov ah, 0x0e
+    int 0x10
+    mov al, 0x20
+    int 0x10
+    mov al, 0x08
+    int 0x10
+    jmp loop_start
+
+disk_error:
+    mov si, msg_error
+    call print_string
+    jmp $
+
+[bits 32]
+init_pm:
+    mov ax, DATA_SEG
+    mov ds, ax
+    mov ss, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    mov ebp, 0x90000
+    mov esp, ebp    ;初始化栈
+
+    jmp sector2_start_32
+
+msg_welcome db "Welcome to XYTriste OS!!!", 0x0d, 0x0a, 0
+boot_drive db 0
+msg_loading db "Loading...", 0x0d, 0x0a, 0
+msg_error db "Disk Error!", 0
+msg_read_ok db "Sector loading OK.", 0x0d, 0x0a, 0
+
+gdt_start:
+
+gdt_null:
+    dd 0x0
+    dd 0x0
+
+gdt_code:
+    dw 0xffff
+    dw 0x0000
+    db 0x00
+    db 0x9a
+    db 11001111b
+    db 0x00
+
+gdt_data:
+    dw 0xffff
+    dw 0x0000
+    db 0x00
+    db 0x92
+    db 11001111b
+    db 0x00
+
+gdt_end:
+
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1
+    dd gdt_start
+
+CODE_SEG equ gdt_code - gdt_start
+DATA_SEG equ gdt_data - gdt_start
+
+times 510-($-$$) db 0
+dw 0xaa55
+
+
+sector2_start_32:
+    ;mov si, msg_kernel_success
+    ;call print_string
+    ;上面两行代码在cli清空所有中断后不再可用
+    
+    mov ebx, 0xb8000
+    mov byte [ebx], 'P'
+    mov byte [ebx + 1], 0x0f
+
+    mov byte [ebx + 2], 'M'
+    mov byte [ebx + 3], 0x0f
+
+    jmp $
+
+msg_message_in_sector2 db "There is sector2!", 0x0d, 0x0a, 0
+msg_kernel_success db "Kernel Loaded Successfully! You are in Sector 2 now!", 0x0d, 0x0a, 0
+times 512-($-sector2_start_32) db 0
+```
+在这段代码中，我们需要注意`mov bx, sector2_start_32`这一行。我们需要知道的是，当我们使用`AH = 02h int 0x13`这样的读扇区服务时，<font color="red">BIOS程序员事先约定好将第二个扇区的内容加载到`es:bx`所对应的地址去。</font>
+所以我们注意到，在初始化阶段我们将`es`初始化为0，而`bx`的地址就是`0x7c00 + 0x200`，也就是第二个扇区的起始位置`0x7e00`。
+这就意味着，我们不能把`init_pm`的代码放在第二个扇区之前，由于我们使用`times`把引导扇区对齐到了512字节。如果我们紧接着`dw 0xaa55`后面写`init pm`的话，这意味着`sector_start_32`实际在第二扇区中的相对位置产生了偏移，进而在使用`jmp CODE_SEG:init_pm`时错误的跳转到了`0x0000:0x7e00`的位置，而实际要执行的代码`sector_start_32`在后面一部分，从而导致CPU无法找到要执行的指令。
+
+### C语言内核
+我们发现，虽然我们在`boot.asm`中成功编写了引导扇区和第二个扇区的代码，但是迄今为止的效率非常低下，如果我们要打印一个字符串，那么就必须不断将字符搬运到`0xb8000`的位置，让字符显示在屏幕上。
+因此，我们希望通过C语言的代码来实现字符的输出。首先，我们修改`boot.asm`的代码：
+```assembly
+[org 0x7C00]
+
+    mov ax, 0
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+
+    mov [boot_drive], dl
+    mov si, msg_loading
+    call print_string
+
+    mov bx, 0x7e00  ;调用约定，读扇区服务使用es:bx作为段:偏移读地址
+
+    mov ah, 0x02
+    mov al, 1
+
+    mov ch, 0
+    mov dh, 0
+    mov cl, 2
+    mov dl, [boot_drive]
+    int 0x13
+
+    jc disk_error
+
+    mov si, msg_read_ok
+    call print_string
+
+    cli
+    lgdt [gdt_descriptor]
+    
+    in al, 0x92
+    or al, 2
+    out 0x92, al
+    
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+
+    jmp CODE_SEG:init_pm
+
+print_string:
+    .loop:
+        lodsb
+        or al, al
+        jz .done
+
+        mov ah, 0x0e
+        int 0x10
+        jmp .loop
+    .done:
+        ret
+
+loop_start:
+    mov ah, 0x00
+    int 0x16
+
+    cmp al, 0x0d
+    je handler_enter
+
+    cmp al, 0x08
+    je handler_backspace
+    
+    mov ah, 0x0e
+    int 0x10
+    jmp loop_start
+
+handler_enter:
+    mov ah, 0x0e
+    int 0x10
+    mov al, 0x0a
+    int 0x10
+
+    jmp loop_start
+
+handler_backspace:
+    mov ah, 0x0e
+    int 0x10
+    mov al, 0x20
+    int 0x10
+    mov al, 0x08
+    int 0x10
+    jmp loop_start
+
+disk_error:
+    mov si, msg_error
+    call print_string
+    jmp $
+
+[bits 32]
+init_pm:
+    mov ax, DATA_SEG
+    mov ds, ax
+    mov ss, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    mov ebp, 0x90000
+    mov esp, ebp    ;初始化栈
+
+    jmp 0x7e00
+
+msg_welcome db "Welcome to XYTriste OS!!!", 0x0d, 0x0a, 0
+boot_drive db 0
+msg_loading db "Loading...", 0x0d, 0x0a, 0
+msg_error db "Disk Error!", 0
+msg_read_ok db "Sector loading OK.", 0x0d, 0x0a, 0
+
+gdt_start:
+
+gdt_null:
+    dd 0x0
+    dd 0x0
+
+gdt_code:
+    dw 0xffff
+    dw 0x0000
+    db 0x00
+    db 0x9a
+    db 11001111b
+    db 0x00
+
+gdt_data:
+    dw 0xffff
+    dw 0x0000
+    db 0x00
+    db 0x92
+    db 11001111b
+    db 0x00
+
+gdt_end:
+
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1
+    dd gdt_start
+
+CODE_SEG equ gdt_code - gdt_start
+DATA_SEG equ gdt_data - gdt_start
+
+times 510-($-$$) db 0
+dw 0xaa55
+
+
+;sector2_start_32:
+;    ;mov si, msg_kernel_success
+;    ;call print_string
+;    ;上面两行代码在cli清空所有中断后不再可用
+;    
+;    mov ebx, 0xb8000
+;    mov byte [ebx], 'P'
+;    mov byte [ebx + 1], 0x0f
+;
+;    mov byte [ebx + 2], 'M'
+;    mov byte [ebx + 3], 0x0f
+;
+;    jmp $
+;
+;msg_message_in_sector2 db "There is sector2!", 0x0d, 0x0a, 0
+;msg_kernel_success db "Kernel Loaded Successfully! You are in Sector 2 now!", 0x0d, 0x0a, 0
+;times 512-($-sector2_start_32) db 0
+```
+这里我们注释掉了所有第二个扇区的代码，同时我们将原来的`mov bx, sector_start_32`修改成了`mov bx, 0x7e00`，这是因为我们现在希望将<font color="red">C语言的代码通过编译成二进制文件后，和`boot.asm`连接起来。</font>通过这样的方式，我们相当于多做了一步“翻译”的步骤，不再面对晦涩难懂的汇编代码，而是选择编写更加“高级”的C语言代码，再和汇编代码链接起来。
+我们编写的第一个内核C语言`kernel.c`代码如下所示：
+```C
+void main(){
+    char* video_memory = (char*)0xb8000;
+
+    *video_memory = 'X';
+    *(video_memory + 1) = 0x4f;
+
+    while(1);
+}
+```
+这一代码实现的效果也很简单，同样是直接写相应的内存去打印字符，同时利用`while(1)`实现了类似于之前`jmp $`的效果。
+为什么是 0xb8000？ 这是一条硬连线。在 PC 的硬件架构中，显卡一直“监听”着内存地址 0xB8000 到 0xBFFFF 这一块区域。
+- 你往内存里写一个字，显卡硬件就会立刻把它投射到显示器上。
+- 这叫 MMIO (Memory Mapped I/O，内存映射输入输出)。你以为你在写内存，其实你在操作显卡。
+真正复杂的部分发生在编译阶段，我们首先需要把C语言代码进行编译，生成目标文件:
+```bash
+gcc -m32 -fno-pie -ffreestanding -c kernel.c -o kernel.o
+```
+其中,`-m32`表示我们编译成32位的代码，`-fno-pie`表示禁用位置无关代码（位置无关的意思指的是，代码之间的关系表示为相对位置，例如某个位置的代码可能会调用“我后面0x200位置的代码”，而在内核中写这样的代码会带来额外的寻址负担，也会很麻烦），`-ffreestanding`用于禁用编译器自动添加头文件，这是因为我们正在编写的是操作系统内核的代码，此时无论我们的磁盘中是否存在标准库的相应实现，我们都是读取不到的，因此即便添加了相应的头文件，我们也无法进行标准库函数的调用。
+编译完成后，我们链接生成相应的二进制文件：
+```bash
+ld -m elf_i386 -o kernel.bin -Ttext 0x7e00 --oformat binary kernel.o
+```
+在编译时，我们的编译器会保存各种符号（函数名称等），在链接时进行解析，标记它们的地址。首先，`-m elf_i386`表示将输入文件当做32位可执行文件进行处理，。`-o kernel.bin`指定了输出二进制位恩建的名称，<font color="red">`-Ttext 0x7e00`是一个关键的参数，它表示在这个可执行文件中，`.text(代码段)`的起始地址为`0x7e00`。</font>正是有了这段代码，我们才能保证在等会和`boot.bin`协作的过程中，能够让内核代码老老实实排在第二个扇区当中。最后，`-oformat`指定了输出文件的格式为原始二进制文件，不包含ELF格式下的各种文件头的内容。
+最后，简单粗暴的用'cat'命令将两个二进制文件拼接起来：
+```bash
+cat boot.bin kernel.bin > os-image.bin
+```
+### 打印字符串
+直接写内存进行显示的方式还是太过于简单粗暴了，我们希望设计一个显卡驱动程序，实现一个可以自动打印字符串的函数，于是我写出了这样的代码：
+```C
+#define VIDEO_MEMORY 0xb8000
+#define MAX_COLS 80
+#define MAX_ROWS 25
+
+void kprint_at(char *message, int row, int col){
+    char *video_memory = (char *) VIDEO_MEMORY;
+    
+    int offset = (row * MAX_COLS + col) * 2;
+    int i;
+    for(i = 0; message[i] != '\0'; i++){
+    
+        int actually_offset = offset + i * 2;
+        video_memory[actually_offset] = message[i];
+        video_memory[actually_offset + 1] = 0x4f;
+    }
+}
+void main(){
+    kprint_at("This is a XYTriste kernel", 0, 0);
+    kprint_at("It works!!!", 1, 0);
+
+    while(1);
+}
+```
+这段代码没有任何编译上的问题，因此它通过了编译，但是在运行时，字符串不仅无法打印出来，QEMU窗口还一直处于一个无限刷新（类似崩溃了）的状态。经过多次尝试，我发现在`kprint_at`函数中，在循环前直接使用:
+```C
+*video_memory = 'A';
+```
+的方式仍然可以正常打印字符，这说明问题出现在了循环的部分，或者说出现在字符串的部分。我尝试把上面这条语句放在循环中，字符没有被打印出来，这说明循环没有被执行过，`message[0]`读取到的是空字符。
+但是为什么会出现这样的问题呢？我们可以看到调用`kprint_at`的参数是一个常量字符串，为什么到了函数中却读不到字符串？
+这里其实产生了两个错误：
+1. 内存错位（main函数并没有被编译在`0x7e00`的位置）
+2. 扇区读取错误
+
+我们首先来解释第一个问题，从我们编写的代码中可以看到，在我们的内核中第一个出现并定义的方法其实是`kprint_at`，这就导致在编译链接的时候，`0x7e00`处保存的其实是`kprint_at`函数的代码，此时我们没有给这个函数设置任何参数，因此导致了栈的错乱，它想要尝试从寄存器中读取参数，却没有得到任何参数提供。解决方法当然就是调换`main`函数和`kprint_at`函数的顺序，首先声明`kprint_at`函数，但是不给出定义。从物理上改变两个函数的顺序，并始终保证main函数出现在整个内核代码的最前面，从而保证它在和`boot.bin`链接后物理位置处于`0x7e00`。
+第二个问题就显得更加复杂一些了，在我们之前的`boot.asm`中，我们是这样读取扇区的：
+```assembly
+    mov ah, 0x02
+    mov al, 1
+
+    mov ch, 0
+    mov dh, 0
+    mov cl, 2
+    mov dl, [boot_drive]
+    int 0x13
+
+    jc disk_error
+```
+其中,`mov al, 1`表示我们要读取1个扇区的大小，需要注意的是，这里的读扇区实际上读的是我们的镜像文件，也就是我们的`os-image.bin`。它是由`boot.bin`以及`kernel.bin`合并而来。由于C语言代码进行汇编以后生成的内容相对臃肿，因此<font color="red">**拼接后的镜像文件实际上大小超过了2KB！！！**</font>这也就导致作为字符串常量的`"This is a XYTriste kernel"`，本来就保存在elf文件的数据段中，数据段落在了第二个扇区之后，因此上述读扇区的代码实际上没有读到这个字符串常量，自然也就无法循环进行正常打印了。
+然而，问题并不仅仅只是有这2个，当我尝试把`mov al, 1`改成了`mov al, 15`时，我遇到了第3个错误，也就是镜像文件的大小太小，`mov al, 15`实际上读取了大约`7.2KB`大小的空间，此时我的`os-image.bin`只有2KB大小，没有足够的空间去读，而我们想要控制大小又比较麻烦。因此采用最粗暴的方法，在镜像文件的后面添加足够多的空扇区，确保有足够的扇区给CPU去读，首先生成空的镜像文件（20个扇区大小）：
+```bash
+dd if=/dev/zero of=zeros.bin bs=512 count=20
+```
+随后进行拼接（注意拼接顺序）：
+```bash
+cat boot.bin kernel.bin zeros.bin > os-image.bin
+```
+这样我们的引导扇区中的代码就可以正常读扇区了，以后如果我们新增了别的内核代码，可能还得继续增加读扇区的大小，确保能够把数据内容读到内存中供内核代码使用。
