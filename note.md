@@ -1198,3 +1198,140 @@ dd if=/dev/zero of=zeros.bin bs=512 count=20
 cat boot.bin kernel.bin zeros.bin > os-image.bin
 ```
 这样我们的引导扇区中的代码就可以正常读扇区了，以后如果我们新增了别的内核代码，可能还得继续增加读扇区的大小，确保能够把数据内容读到内存中供内核代码使用。
+
+### 打印字符串（调整光标位置）
+先前，我们实现了打印字符串的功能，其实无非也就是通过写内存（MMIO，内存映射IO端口）的方式将文字进行循环打印输出到显示端中。
+但是这样做的问题在于，显示端的光标并不会随着文字的输出而移动,这是因为输出的内容（写入到显存）以及控制光标位置的VGA寄存器本质上不是一个东西，所以仅仅只是写显存的内容并不会移动光标的位置。
+因此，我们更新了我们`kernel.c`的代码，实现了光标随输出内容移动的功能：
+```C
+// kernel.c
+
+//显存配置
+#define VIDEO_MEMORY 0xb8000
+#define MAX_COLS 80
+#define MAX_ROWS 25
+
+// 端口配置（VGA控制端口）
+#define REG_SCREEN_CTRL 0x3d4
+#define REG_SCREEN_DATA 0x3d5
+
+void kprint_at(char *message, int row, int col);
+void port_byte_out(unsigned short port, unsigned char data);
+unsigned char port_byte_in(unsigned short port);
+
+int get_cursor_offset();
+void set_cursor_offset(int offset);
+
+void print_char(char character, int col, int row, char attribute_byte);
+void kprint(char *message);
+void clean_screen();
+
+void main(){
+    clean_screen();
+    kprint("This is a XYTriste kernel\n");
+    kprint("It works!!!");
+
+    while(1);
+}
+void kprint_at(char *message, int row, int col){
+    char *video_memory = (char *) VIDEO_MEMORY;
+    
+    int offset = (row * MAX_COLS + col) * 2;
+    int i;
+    for(i = 0; message[i] != '\0'; i++){
+        int actually_offset = offset + i * 2;
+        video_memory[actually_offset] = message[i];
+        video_memory[actually_offset + 1] = 0x4f;
+    }
+}
+// ---------------------------------------------------------
+// 1. 底层硬件通信函数 (内联汇编)
+// ---------------------------------------------------------
+// 向端口写一个字节(outb)
+void port_byte_out(unsigned short port, unsigned char data){
+    __asm__("out %%al, %%dx" : : "a"(data), "d"(port));     //AT&T语法，源操作数在前目标操作数在后
+    //也就是说这其实是把al寄存器中的值写到dx对应的端口中去
+}
+// 从端口读一个字节(inb)
+unsigned char port_byte_in(unsigned short port){
+    unsigned char result;
+    __asm__("in %%dx, %%al" : "=a"(result) : "d"(port));
+    return result;
+}
+// ---------------------------------------------------------
+// 2. 屏幕驱动函数
+// ---------------------------------------------------------
+// 获取当前光标位置(0-1999)
+int get_cursor_offset(){
+    port_byte_out(REG_SCREEN_CTRL, 14); // 将数据14写入到索引寄存器，告诉它我们需要获取光标位置的高8位
+    int offset = port_byte_in(REG_SCREEN_DATA) << 8; //获取光标位置的高8位，左移保证数据是高8位的
+    port_byte_out(REG_SCREEN_CTRL, 15); // 声明我们要读取光标位置的低8位
+    offset += port_byte_in(REG_SCREEN_DATA);
+    return offset * 2;  // 显存中每个字符占2字节
+}
+
+//设置光标位置
+void set_cursor_offset(int offset){
+    //把显存偏移量转换回字符索引（2）
+    offset /= 2;
+
+    //写入高8位来调整光标位置
+    port_byte_out(REG_SCREEN_CTRL, 14);
+    port_byte_out(REG_SCREEN_DATA, (unsigned char)(offset >> 8));
+    
+    //写入低8位来调整光标位置
+    port_byte_out(REG_SCREEN_CTRL, 15);
+    port_byte_out(REG_SCREEN_DATA, (unsigned char)(offset & 0xff));
+}
+
+//打印单个字符并处理光标移动和换行
+void print_char(char character, int col, int row, char attribute_byte){
+    //创建显存指针
+    unsigned char* video_memory = (unsigned char*) VIDEO_MEMORY;
+
+    //默认颜色为白底黑字
+    if(!attribute_byte){
+        attribute_byte = 0x0f;
+    }
+
+    int offset;
+    if(col >= 0 && row >= 0){
+        offset = (row * MAX_COLS + col) * 2;
+    }else{
+        offset = get_cursor_offset();
+    }
+    if(character == '\n'){ //处理换行符
+        int rows = offset / (2 * MAX_COLS);     // 计算当前所在行，由于offset表示字节偏移量，所以其实要把列字节数*2
+        // 移动到下一行开头
+        offset = get_cursor_offset();
+        rows = offset / (2 * MAX_COLS);
+        offset = (rows + 1) * (2 * MAX_COLS); // 下一行的开头
+    }else{
+        video_memory[offset] = character;
+        video_memory[offset + 1] = attribute_byte;
+        offset += 2;
+    }
+    set_cursor_offset(offset);
+}
+// 打印字符串（对print_char)的封装
+void kprint(char *message){
+    int i = 0;
+    for(; message[i] != '\0'; i++){
+        print_char(message[i], -1, -1, 0);
+    }
+}
+void clean_screen(){
+    int screen_size = MAX_ROWS * MAX_COLS;
+    unsigned char *video_memory = (unsigned char *)VIDEO_MEMORY;
+    for(int i = 0; i < screen_size; i++){
+        video_memory[i * 2] = ' ';
+        video_memory[i * 2 + 1] = 0x0f;
+    }
+    set_cursor_offset(0);
+}
+```
+在这一次的更新中，我们实现了多个函数。其中包含两个内联汇编函数`port_byte_out`和`port_byte_in`，在这部分中最值得注意的是，在`gcc`编译器中默认我们内联汇编采用的是`AT&T`语法，这与我们直接编写汇编代码所遵循的`Intel`标准不同。在`Intel`标准下，一个完整的汇编语句构成是由`关键字 目标操作数, 源操作数`构成的，而`AT&T`语法则交换了目标操作数和源操作数的顺序。
+此外，我们也需要知道，`out`和`in`不同于`mov`这样的汇编指令，当CPU遇到`out`和`in`这样的指令时，它们会把相应的内容当作端口号（内存地址）去处理，从而实现对于端口的读写。
+随后，我们实现了屏幕驱动的相关函数，这里需要注意的就是如何计算光标位置并打印的的函数`print_char`。参数`col`和`row`指定了输出位置的行列（这里的行列指的是VGA标准中的对应行列，行列下标分别从`0-24`以及`0-79`），经过计算得到要输出的位置以及光标放置的位置。
+最后，我们也实现了一个清除屏幕的函数，实际上就是在整个显示位置上打印空字符，并把光标挪到最前面，模拟清空后的效果。
+
