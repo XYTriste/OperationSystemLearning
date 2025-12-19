@@ -9,6 +9,33 @@
 #define REG_SCREEN_CTRL 0x3d4
 #define REG_SCREEN_DATA 0x3d5
 
+typedef unsigned int u32;
+typedef unsigned short u16;
+typedef unsigned char u8;
+
+typedef struct{
+    u16 low_offset; // 中断处理函数的低16位地址
+    u16 sel;        // 内核段选择子
+    u8 always0;
+
+    // 标志位 byte: 
+    // Bit 7: Present (1)
+    // Bit 5-6: DPL (Privilege) (00)
+    // Bit 0-4: Type (01110 = 32-bit Interrupt Gate)
+    // 所以通常是 0x8E (1 00 0 1110)
+    u8 flags;
+    u16 high_offset; // 中断处理函数的高16位地址
+} __attribute__((packed)) idt_gate_t;
+
+typedef struct{
+    u16 limit;
+    u32 base;
+} __attribute__((packed)) idt_register_t;
+
+#define IDT_ETRIES 256
+idt_gate_t idt[IDT_ETRIES];
+idt_register_t idt_reg;
+ 
 void kprint_at(char *message, int row, int col);
 void port_byte_out(unsigned short port, unsigned char data);
 unsigned char port_byte_in(unsigned short port);
@@ -20,10 +47,14 @@ void print_char(char character, int col, int row, char attribute_byte);
 void kprint(char *message);
 void clean_screen();
 
+void set_idt_gate(int n, u32 handler);
+
 void main(){
     clean_screen();
     kprint("This is a XYTriste kernel\n");
     kprint("It works!!!");
+
+    // asm volatile("sti");
 
     while(1);
 }
@@ -122,4 +153,27 @@ void clean_screen(){
         video_memory[i * 2 + 1] = 0x0f;
     }
     set_cursor_offset(0);
+}
+
+//设置IDT门
+void set_idt_gate(int n, u32 handler){
+    // n:中断号，大小从0-255;  handler:函数的地址，32位的数字
+    
+    idt[n].low_offset = handler & 0xff;  //设置idt的低16位
+
+    idt[n].sel = 0x08;  // 设置段选择子，实际上是在计算相对于GDT起始地址的偏移
+
+    idt[n].always0 = 0; // 保留位，必须为0
+
+    idt[n].flags = 0x8e;    // 0x8E = 1(Present) 00(Privilege) 0(System) 1110(32-bit Interrupt Gate)
+
+    idt[n].high_offset = handler >> 8;
+}
+
+// 设置IDT表的地址
+void set_idt(){
+    idt_reg.base = (u32) &idt; // 设置IDT表的起始地址
+    idt_reg.limit = sizeof(idt) - 1; // 设置IDT表的大小（按字节表示，确保不会数组越界。
+
+    __asm__ volatile("lidt (%0)" : : "r"(&idt_reg));
 }
