@@ -1336,3 +1336,253 @@ void clean_screen(){
 随后，我们实现了屏幕驱动的相关函数，这里需要注意的就是如何计算光标位置并打印的的函数`print_char`。参数`col`和`row`指定了输出位置的行列（这里的行列指的是VGA标准中的对应行列，行列下标分别从`0-24`以及`0-79`），经过计算得到要输出的位置以及光标放置的位置。
 最后，我们也实现了一个清除屏幕的函数，实际上就是在整个显示位置上打印空字符，并把光标挪到最前面，模拟清空后的效果。
 
+### IDT（Interrupt description table，中断描述符表）的建立
+现在，我们的内核可以正常的打印出字符串并处理换行。然而，我们的内核此时仍然是一个无法从外界接收信息的残疾人，因为在引导扇区中，我们使用了`cli`来关闭CPU处理中断的功能，更加具体的说。在CPU中有一个特殊的标志位寄存器，当我们调用`cli`时，这一寄存器的值将变成0。此时虽然CPU可以接收到中断请求，但是不会进行任何处理，直到中断处理恢复。
+当进入保护模式以后，寻址方式就变成了`段选择子：偏移`，且寻址能力也从20位提升到了32位。由于`IVT`以4字节为单位，寻址方式和保护模式下有所不同。因此，进入保护模式以后`IVT`就不再可用了。
+此时，如果我们需要进行相应的中断处理，就必须设置`IDT`。更加具体的说，在保护模式下我们调用中断时，CPU会检查`IDT`表，根据我们使用的中断号（索引），去相应的地址中寻找中断处理函数。当然，在访问地址之前，`GDT`会检查相应地址的可用性以及特权等级、地址所在段的类型等信息，确保不会产生地址的误用。
+`IDT`中一个条目大小为8个字节，每个字节具体含义如下所示：
+```C
+typedef struct{
+    u16 low_offset; // 中断处理函数的低16位地址
+    u16 sel;        // 内核段选择子
+    u8 always0;     // 保留字节
+
+    // 标志位 byte: 
+    // Bit 7: Present (1)
+    // Bit 5-6: DPL (Privilege) (00)
+    // Bit 0-4: Type (01110 = 32-bit Interrupt Gate)
+    // 所以通常是 0x8E (1 00 0 1110)
+    u8 flags;
+    u16 high_offset; // 中断处理函数的高16位地址
+} __attribute__((packed)) idt_gate_t;
+```
+> __attribute__((packed))的作用在于<font color="red">取消结构体或联合体成员之间的填充（padding），使其内存布局完全紧凑，按字节顺序排列。</font>这样做的目的在于，避免例如`char`和`int`这样不同字节大小的结构体在声明时被强制对齐到8字节。
+其中，`sel`的含义表示相应的中断处理函数所在的段。在平坦模式下，整个内存空间被划分为一个代码段，因此此处的段选择子的值就是`0x08`。此外，`always`所在的第5字节为保留字节，这一字节的值必须为0。
+类似于GDT，我们同样需要让CPU知道`IDT`表所在位置，大小（确保访问不会越界）等信息，因此就有了我们的`set_idt`函数：
+```C
+// 设置IDT表的地址
+void set_idt(){
+    idt_reg.base = (u32) &idt; // 设置IDT表的起始地址
+    idt_reg.limit = sizeof(idt) - 1; // 设置IDT表的大小（按字节表示，确保不会数组越界。
+
+    __asm__ volatile("lidt (%0)" : : "r"(&idt_reg));
+}
+```
+注意这里的内联汇编语句，`lidt`其实指的就是加载`idt`表，相应的信息都保存在了`idt_reg`这一结构中，它是一个6字节的结构体：
+```C
+typedef struct{
+    u16 limit;   // IDT表的条目限制数量（最多256，索引从0-255）
+    u32 base;   // IDT表的起始地址
+} __attribute__((packed)) idt_register_t;
+```
+在我们的实现中，我们使用了一个外部声明的函数`isr1()`，模拟中断处理函数在其他地址的情景：
+```C
+extern void isr1();
+```
+这个函数没有任何内容，它被定义在`interrupt.asm`文件中，内容为：
+```assembly
+global isr1
+
+isr1:
+    iret
+```
+为什么要用这么复杂的方式，而不是直接定义函数然后`return`？这是因为中断处理程序的返回命令是`iret`（需额外弹出标志寄存器）而不是`ret`，因此只能使用汇编的方式实现。
+最后，我们在编译的时候不要忘记了把新建的汇编文件进行编译:
+```bash
+nasm -f elf32 ./interrupt.asm -o interrupt.o
+```
+链接的时候同样需要加上：
+```bash
+ld -m elf_i386 -o kernel.bin -Ttext 0x7e00 --oformat binary kernel.o interrupt.o
+```
+最后，我们在`main`函数中进行相应的设置并打印语句，只要看到最后的`intetrupt handled!`就说明内核成功处理了中断并返回了。
+```C
+void main(){
+    clean_screen();
+
+    kprint("Interrupt Start!");
+    
+    set_idt_gate(1, (u32) isr1);
+    set_idt();
+
+    __asm__ volatile("int $1");
+    kprint("Interrupt handled!");
+    
+    while(1);
+}
+```
+### 键盘中断的处理
+现在，我们需要让我们的操作系统进一步的完善了，我们希望操作系统可以正确的处理我们的键盘输入。
+要处理键盘输入，我们首先需要了解键盘输入的原理，当我们按下键盘：
+1. 触发 IRQ1 (中断号 33)。
+
+2. CPU 查 IDT -> 查 GDT -> 跳到 keyboard_handler。
+
+3. 最关键的一步：代码需要去读取 0x60 端口（还记得之前的显卡端口吗？键盘也有端口）。
+
+4. 从 0x60 读出来的就是按键的扫描码（Scan Code）。
+
+5. 把扫描码转换成 ASCII 字符，打印在屏幕上。
+
+那么，根据上述内容，我们首先需要一个预定义好的扫描码映射ASCII字符表：
+```C
+char keymap[128] = {
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', /* Backspace */
+    '\t', /* Tab */
+    'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', /* Enter key */
+    0, /* 29   - Control */
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',   0, /* Left shift */
+    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',   0, /* Right shift */
+    '*',
+    0,  /* Alt */
+    ' ', /* Space bar */
+    // ... 后面的键先省略，基本够用了 ...
+};
+```
+建立好了映射表之后，我们进行键盘中断的初始化，包括端口号的映射（这部分暂时不纠结，照抄AI代码）以及设置`IDT`等等：
+```C
+void init_keyboard() {
+    // --- 1. PIC 重映射 (魔术代码，照抄即可) ---
+    // 这里的目的是把 IRQ1 (键盘) 映射到 IDT 的第 33 号位置 (0x21)
+    port_byte_out(0x20, 0x11);
+    port_byte_out(0xA0, 0x11);
+    port_byte_out(0x21, 0x20); // 主 PIC 从 0x20 (32) 开始
+    port_byte_out(0xA1, 0x28); // 从 PIC 从 0x28 (40) 开始
+    port_byte_out(0x21, 0x04);
+    port_byte_out(0xA1, 0x02);
+    port_byte_out(0x21, 0x01);
+    port_byte_out(0xA1, 0x01);
+    port_byte_out(0x21, 0x0);
+    port_byte_out(0xA1, 0x0);
+    
+    // --- 新增：设置中断屏蔽掩码 (IMR) ---
+    // 0xFD = 1111 1101
+    // 意思是：除了 IRQ1 (键盘) 是 0，其他全是 1 (屏蔽)
+    // 这样 IRQ0 (时钟) 就不会来打扰我们了！
+    // port_byte_out(0x21, 0xFD);
+
+    // --- 2. 设置 IDT ---
+    // 我们要把第 33 号中断 (IRQ1) 指向 isr_keyboard
+    // 注意：isr_keyboard 需要先 extern 声明
+    extern void isr_keyboard();
+    
+    // 33 是 0x21 (32 + 1)
+    set_idt_gate(33, (u32)isr_keyboard);
+    set_idt();
+
+    // --- 3. 开启中断！---
+    // 这就是之前的“危险动作”，现在可以安全执行了
+    __asm__ volatile("sti");
+    kprint("Keyboard is init\n");
+}
+```
+初始化完成以后，我们就可以编写相应的中断处理函数，从对应端口读入键盘输入并进行相应处理：
+```C
+void keyboard_handler_c(){
+    u8 scancode;    // 保存键盘按键时的扫描码
+    char ascii_char;    // 对应的字符
+
+    scancode = port_byte_in(KEYBOARD_PORT);  // 从键盘读取一个字符
+    
+    // print_hex(scancode);
+
+    if(scancode < 0x80){    // 键盘“按下”和“松开”是不同的扫描码，此时只处理按下逻辑
+        ascii_char = keymap[scancode];
+
+        // print_hex(scancode);
+        print_hex((u8) ascii_char);
+
+        char str[2] = {ascii_char, 0};  // 构建字符串用于打印
+        kprint(str);
+    }
+
+    port_byte_out(0x20, 0x20);
+    //发送EOI(End of Interrupt，中断结束信号)给主PIC
+    //目的在于表示中断已处理完成
+}
+```
+这里有一个重点就是最后的`port_byte_out(0x20, 0x20);`，这是因为：
+> PIC 是一个有状态的硬件。当它发出一个中断后，它会把对应的 ISR (In-Service Register) 位拉高，标记为“正在服务中”。 PIC 会一直等待 CPU 发送一个 EOI (End of Interrupt) 信号（往端口 0x20 写 0x20）。 如果不发送 EOI，PIC 会认为：“CPU 还在忙着处理上一个中断呢，我不能打扰它。”。因此，在硬件中断的最后我们需要发送一个信号告诉PIC中断已经处理完成。
+
+除此之外，不要忘记中断处理是需要相应汇编指令来返回的：
+```assembly
+interrupt.asm
+
+[bits 32]
+extern keyboard_handler_c
+global isr_stub     ; 全局符号，确保能被编译器看到
+global isr_keyboard
+
+isr_stub:
+    iret
+
+isr_keyboard:
+    pusha   ; 保存所有通用寄存器（push all）
+    call keyboard_handler_c
+    popa    ; 恢复所有通用寄存器 (pop all)
+
+    iretd
+```
+这样，我们就完成了对于键盘输入的处理...了吗？
+在这里我踩了一个非常隐蔽的坑，当我完成一系列的`nasm`、`gcc`、`ld`以及`cat`最后`qemu`后，我发现系统正常的运行，但是对我的键盘输入没有任何反应。
+由于我不会（我猜可能也不行）在QEMU中调试内核代码，因此只能采用最原始的方式，在`kernel.c`中添加输出代码：
+```C
+void print_hex(u8 n) {  // unsigned short
+    char *hex = "0123456789ABCDEF";
+    char out[4]; // 2个数字 + 空格 + 结束符
+    out[0] = hex[(n >> 4) & 0xF]; // 取高4位
+    out[1] = hex[n & 0xF];        // 取低4位
+    out[2] = ' ';                 // 加个空格方便看
+    out[3] = 0;
+    kprint(out);
+}
+```
+然后，在键盘中断处理函数中添加这个函数，按下键盘上的'A'键以后，观察扫描码的输出情况:
+$$
+(Press Key)A = 1E 9E
+$$
+可以看到系统确实正确的调用了键盘中断处理函数，并输出了扫描码。但是为什么就是不打印输入字符呢？明明我写了这几句：
+```C
+ascii_char = keymap[scancode];
+char str[2] = {ascii_char, 0}; 
+kprint(str);
+```
+于是我又尝试直接打印映射后的ASCII字符，终于发现了问题：
+```C
+ascii_char = keymap[scancode];
+
+print_hex((u8) ascii_char);
+
+char str[2] = {ascii_char, 0};  // 构建字符串用于打印
+kprint(str);
+```
+打印出来的全都是`00`！这对我的世界观冲击实在是太大了，明明我通过`ascii_char = keymap[scancode];`获取了字符，`scancode`的`1E`映射到`keymap`里的确是对应字符'A'，结果到了输出的时候就变成了`00`了。
+那么问题来了，`scancode`的`1E`映射到`keymap`里的确是对应字符'A'...吗？
+这牵扯到了一个极其隐蔽的坑：数据段加载问题。
+简而言之，在`bin`文件中，内容主要分为代码段和数据段。其中，数据段又区分为"可读写数据`.data`"以及"只读数据`.rodata`"。
+在我们之前的定义中，扫描码与ASCII字符的数组声明为：
+```C
+char keymap[128] = {...};
+```
+问题出现在链接器（`ld`）生成二进制文件的时候，为了实现内存对齐，可能会在"代码段"与"数据段"之间留下空白区域（填充0），完成4KB的内存对齐。
+对照我们编译链接前后的文件，我们发现：
+$$
+kernel.o = 4KB (before ld)
+kernel.o = 6KB (after ld)
+$$
+我们发现的确发生了内存对齐，这里根据AI的说法，我们了解到：
+> 默认链接脚本会把各段 (.text、.rodata、.data、.bss …) 按 4 KB 页边界对齐。
+假设 kernel.o 里真正有用的东西只有 3.1 KB，可它落在两个 4 KB 页里，于是 ld 在第一个段末尾塞 0.9 KB 的填充，第二个段再塞 2 KB 的填充，结果就 “膨胀” 到 6 KB 甚至 8 KB。
+这也就意味着，我们的**代码段和数据段之间隔着一段距离!!!**
+而在我的`boot.asm`中，读取的扇区数量为：
+```assembly
+mov ah, 0x02
+mov al, 15
+```
+这实际读取的大小大约是`7.5KB`，而我最终的文件`os-image.bin`由`boot.bin kernel.bin zeros.bin`拼接而成，大小约为`16KB`。
+这就说明`keymap`所在的数据段被放在了文件中靠后的位置，因此在读取的时候,`keymap`的值所在的数据段实际上并没有被读入到内存。在裸机中，未被加载到内存的区域上的部分读出来的数据是随机的，根据那块区域的电平决定。
+暂时的解决方案就是修改`keymap`的定义，为它增加只读属性：
+```C
+const char keymap[128] = {...};
+```
+由于只读数据段`.rodata`通常紧跟在代码段`.text`之后，因此只要保证代码段 + 只读数据段的大小没有超过15个扇区，就能够保证被加载到内存中，继而能够正常使用。

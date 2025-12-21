@@ -9,6 +9,9 @@
 #define REG_SCREEN_CTRL 0x3d4
 #define REG_SCREEN_DATA 0x3d5
 
+// 键盘端口配置
+#define KEYBOARD_PORT 0x60
+
 typedef unsigned int u32;
 typedef unsigned short u16;
 typedef unsigned char u8;
@@ -32,10 +35,27 @@ typedef struct{
     u32 base;
 } __attribute__((packed)) idt_register_t;
 
-#define IDT_ETRIES 256
+#define IDT_ETRIES 256  // IDT表的大小，每个项目占据8字节 
 idt_gate_t idt[IDT_ETRIES];
 idt_register_t idt_reg;
- 
+
+// 键盘扫描码映射表 (Scan Code Set 1)
+// 索引是扫描码，值是对应的 ASCII 字符
+// 0 表示不可打印字符 (如 Ctrl, Alt)
+char keymap[128] = {
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', /* Backspace */
+    '\t', /* Tab */
+    'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', /* Enter key */
+    0, /* 29   - Control */
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',   0, /* Left shift */
+    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',   0, /* Right shift */
+    '*',
+    0,  /* Alt */
+    ' ', /* Space bar */
+    // ... 后面的键先省略，基本够用了 ...
+};
+
+void print_hex(u8 n);
 void kprint_at(char *message, int row, int col);
 void port_byte_out(unsigned short port, unsigned char data);
 unsigned char port_byte_in(unsigned short port);
@@ -48,16 +68,37 @@ void kprint(char *message);
 void clean_screen();
 
 void set_idt_gate(int n, u32 handler);
+void set_idt();
+
+extern void isr_stub();
+void init_keyboard();
+void keyboard_handler_c();
 
 void main(){
     clean_screen();
-    kprint("This is a XYTriste kernel\n");
-    kprint("It works!!!");
 
-    // asm volatile("sti");
+    for(int i = 0; i < IDT_ETRIES; i++){
+        set_idt_gate(i, (u32) isr_stub);
+    }
 
+    kprint("Try to type something:");
+
+    init_keyboard();
+
+    
     while(1);
 }
+
+void print_hex(u8 n) {
+    char *hex = "0123456789ABCDEF";
+    char out[4]; // 2个数字 + 空格 + 结束符
+    out[0] = hex[(n >> 4) & 0xF]; // 取高4位
+    out[1] = hex[n & 0xF];        // 取低4位
+    out[2] = ' ';                 // 加个空格方便看
+    out[3] = 0;
+    kprint(out);
+}
+
 void kprint_at(char *message, int row, int col){
     char *video_memory = (char *) VIDEO_MEMORY;
     
@@ -159,15 +200,16 @@ void clean_screen(){
 void set_idt_gate(int n, u32 handler){
     // n:中断号，大小从0-255;  handler:函数的地址，32位的数字
     
-    idt[n].low_offset = handler & 0xff;  //设置idt的低16位
+    idt[n].low_offset = handler & 0xffff;  //设置idt的低16位
 
     idt[n].sel = 0x08;  // 设置段选择子，实际上是在计算相对于GDT起始地址的偏移
+    //注意在平台模式下，内核代码段的起始位置为0x08（基址偏移）。
 
     idt[n].always0 = 0; // 保留位，必须为0
 
     idt[n].flags = 0x8e;    // 0x8E = 1(Present) 00(Privilege) 0(System) 1110(32-bit Interrupt Gate)
 
-    idt[n].high_offset = handler >> 8;
+    idt[n].high_offset = (handler >> 16) & 0xFFFF;
 }
 
 // 设置IDT表的地址
@@ -176,4 +218,63 @@ void set_idt(){
     idt_reg.limit = sizeof(idt) - 1; // 设置IDT表的大小（按字节表示，确保不会数组越界。
 
     __asm__ volatile("lidt (%0)" : : "r"(&idt_reg));
+}
+
+void init_keyboard() {
+    // --- 1. PIC 重映射 (魔术代码，照抄即可) ---
+    // 这里的目的是把 IRQ1 (键盘) 映射到 IDT 的第 33 号位置 (0x21)
+    port_byte_out(0x20, 0x11);
+    port_byte_out(0xA0, 0x11);
+    port_byte_out(0x21, 0x20); // 主 PIC 从 0x20 (32) 开始
+    port_byte_out(0xA1, 0x28); // 从 PIC 从 0x28 (40) 开始
+    port_byte_out(0x21, 0x04);
+    port_byte_out(0xA1, 0x02);
+    port_byte_out(0x21, 0x01);
+    port_byte_out(0xA1, 0x01);
+    port_byte_out(0x21, 0x0);
+    port_byte_out(0xA1, 0x0);
+    
+    // --- 新增：设置中断屏蔽掩码 (IMR) ---
+    // 0xFD = 1111 1101
+    // 意思是：除了 IRQ1 (键盘) 是 0，其他全是 1 (屏蔽)
+    // 这样 IRQ0 (时钟) 就不会来打扰我们了！
+    // port_byte_out(0x21, 0xFD);
+
+    // --- 2. 设置 IDT ---
+    // 我们要把第 33 号中断 (IRQ1) 指向 isr_keyboard
+    // 注意：isr_keyboard 需要先 extern 声明
+    extern void isr_keyboard();
+    
+    // 33 是 0x21 (32 + 1)
+    set_idt_gate(33, (u32)isr_keyboard);
+    set_idt();
+
+    // --- 3. 开启中断！---
+    // 这就是之前的“危险动作”，现在可以安全执行了
+    __asm__ volatile("sti");
+    kprint("Keyboard is init\n");
+}
+
+//  键盘处理函数
+void keyboard_handler_c(){
+    u8 scancode;    // 保存键盘按键时的扫描码
+    char ascii_char;    // 对应的字符
+
+    scancode = port_byte_in(KEYBOARD_PORT);  // 从键盘读取一个字符
+    
+    // print_hex(scancode);
+
+    if(scancode < 0x80){    // 键盘“按下”和“松开”是不同的扫描码，此时只处理按下逻辑
+        ascii_char = keymap[scancode];
+
+        // print_hex(scancode);
+        // print_hex((u8) ascii_char);
+
+        char str[2] = {ascii_char, 0};  // 构建字符串用于打印
+        kprint(str);
+    }
+
+    port_byte_out(0x20, 0x20);
+    //发送EOI(End of Interrupt，中断结束信号)给主PIC
+    //目的在于表示中断已处理完成
 }
