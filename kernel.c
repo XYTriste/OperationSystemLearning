@@ -74,6 +74,16 @@ extern void isr_stub();
 void init_keyboard();
 void keyboard_handler_c();
 
+void user_input(char *input);
+
+// 引用string.c中的函数
+extern int strcmp(char s1[], char s2[]);
+extern void append(char s[], char n);
+extern void backspace(char s[]);
+
+// 全局缓冲区，用来存储用户输入的命令
+char key_buffer[256];
+
 void main(){
     clean_screen();
 
@@ -81,10 +91,9 @@ void main(){
         set_idt_gate(i, (u32) isr_stub);
     }
 
-    kprint("Try to type something:");
-
+    kprint("> ");
+    key_buffer[0] = '\0';
     init_keyboard();
-
     
     while(1);
 }
@@ -186,6 +195,17 @@ void kprint(char *message){
         print_char(message[i], -1, -1, 0);
     }
 }
+// 打印退格键，本质上是退回一个光标位置输出空格覆盖原字符，再把光标回退一格。
+void kprint_backspace(){
+    int offset = get_cursor_offset() - 2;
+    int row = offset / (2 * MAX_COLS);
+    int col = (offset / 2) % MAX_COLS;
+
+    if(offset >= 0){
+        print_char(' ', col, row, 0x0f);
+        set_cursor_offset(offset);
+    }
+}
 void clean_screen(){
     int screen_size = MAX_ROWS * MAX_COLS;
     unsigned char *video_memory = (unsigned char *)VIDEO_MEMORY;
@@ -264,12 +284,23 @@ void keyboard_handler_c(){
     
     // print_hex(scancode);
 
-    if(scancode < 0x80){    // 键盘“按下”和“松开”是不同的扫描码，此时只处理按下逻辑
+    if(scancode > 57){  // 忽略键盘松开按键和其他无效键
+        return;
+    }
+    if(scancode == 0x0E){   // 退格键
+        backspace(key_buffer);  // 从缓冲区中删除字符
+        kprint_backspace();     // 从视觉上回退光标
+    }else if(scancode == 0x1C){     // 处理回车键
+        kprint("\n");
+        user_input(key_buffer);
+        key_buffer[0] = '\0';
+        kprint("> ");
+    }else{    // 键盘“按下”和“松开”是不同的扫描码，此时只处理按下逻辑
         ascii_char = keymap[scancode];
 
         // print_hex(scancode);
         // print_hex((u8) ascii_char);
-
+        append(key_buffer, ascii_char);
         char str[2] = {ascii_char, 0};  // 构建字符串用于打印
         kprint(str);
     }
@@ -277,4 +308,28 @@ void keyboard_handler_c(){
     port_byte_out(0x20, 0x20);
     //发送EOI(End of Interrupt，中断结束信号)给主PIC
     //目的在于表示中断已处理完成
+}
+
+// 命令执行函数
+void user_input(char *input){
+    if(strcmp(input, "EXIT") == 0){
+        kprint("Stopping the opertion system, Good Bye!\n");
+        __asm__ volatile("hlt");
+    }else if(strcmp(input, "PAGE") == 0){
+        // 这是一个测试命令，用来测试动态内存分配是否还没实现
+        // 实际上我们可以用它来打印当前物理内存位置
+        u32 phys_addr;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(phys_addr));
+        kprint("Page Directory: ");
+        print_hex(phys_addr);
+        kprint("\n");
+    }else if(strcmp(input, "HI") == 0){
+        kprint("Hello, I am the XYTriste operation system.\n");
+    }else if(strcmp(input, "CLS") == 0){
+        clean_screen();
+    }else{
+        kprint("The \"");
+        kprint(input);
+        kprint("\" is not an internal or external command,\n not a runnable program or batch file..\n");
+    }
 }
