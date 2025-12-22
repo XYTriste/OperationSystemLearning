@@ -1586,3 +1586,176 @@ mov al, 15
 const char keymap[128] = {...};
 ```
 由于只读数据段`.rodata`通常紧跟在代码段`.text`之后，因此只要保证代码段 + 只读数据段的大小没有超过15个扇区，就能够保证被加载到内存中，继而能够正常使用。
+
+### 命令行的实现
+现在我们的键盘可以读入我们输入的字符了，因此我们可以尝试着做一个命令行，并处理一些简单的命令。为了实现对于命令的识别，我们必须自己实现标准库`string.c`中的一些常用方法:
+```C
+// 1. 计算字符串长度
+int strlen(char s[]){
+    int len = 0;
+    while(s[len] != '\0'){
+        len++;
+    }
+    return len;
+}
+
+// 2. 反转字符串（用于实现字符串与整数转换）
+void reverse(char s[]){
+    int c, i, j;
+    for (i = 0, j = strlen(s) - 1; i < j; i++, j--) {
+        c = s[i];
+        s[i] = s[j];
+        s[j] = c;
+    }
+}
+
+// 3. 字符串比较函数
+int strcmp(char s1[], char s2[]){
+    int i;
+    for(i = 0; s1[i] == s2[i]; i++){
+        if(s1[i] == '\0'){
+            return 0;
+        }
+    }
+    return s1[i] - s2[i];
+}
+
+// 4. 在字符串末尾追加一个字符
+void append(char s[], char n){
+    int len = strlen(s);
+    s[len] = n;
+    s[len + 1] = '\0';
+}
+
+// 5. 退格键删除字符串
+void backspace(char s[]){
+    int len = strlen(s);
+    if(len > 0){
+       s[len - 1] = '\0'; 
+    }
+    
+}
+```
+我们实现了一些常用的`string`库方法，接下来我们只要在`kernel.c`中进行外部函数声明，并在链接时将`string.c`文件链接进来，就可以调用这些方法了。
+现在，我们着手实现自己的命令行，为了实现这一功能，我们需要解决几个问题：
+1. 我们需要进行退格键的实现（这里与我们之前在汇编中实现的退格功能相同，都是先把光标左移一个窗格（2字节），再输出一个空格字符，最后再把光标左移一格。）
+2. 我们需要避免退格键把所有字符都删除从而导致看不见命令提示符'> '，因此我们需要进行光标位置的判断，只有当光标删除后的位置仍然大于0才允许删除（命令提示符在0的位置）。
+3. 我们需要实现一些命令的实际执行逻辑，比如`page`命令就执行相应的代码。
+4. 我们需要对回车键进行特殊处理，当按下回车键时，我们就把用户之前的输入作为一个命令进行识别。
+为此，我们修改了`kernel.c`中的`keyboard_handler_c`函数，并新增了`user_input`函数来处理用户的命令：
+```C
+void keyboard_handler_c(){
+    u8 scancode;    // 保存键盘按键时的扫描码
+    char ascii_char;    // 对应的字符
+
+    scancode = port_byte_in(KEYBOARD_PORT);  // 从键盘读取一个字符
+    
+    // print_hex(scancode);
+
+    if(scancode > 57){  // 忽略键盘松开按键和其他无效键
+        port_byte_out(0x20, 0x20);  
+        return;
+    }
+    if(scancode == 0x0E){   // 退格键
+        backspace(key_buffer);  // 从缓冲区中删除字符
+        kprint_backspace();     // 从视觉上回退光标
+    }else if(scancode == 0x1C){     // 处理回车键
+        kprint("\n");
+        user_input(key_buffer);
+        key_buffer[0] = '\0';
+        kprint("> ");
+    }else{    // 键盘“按下”和“松开”是不同的扫描码，此时只处理按下逻辑
+        ascii_char = keymap[scancode];
+
+        // print_hex(scancode);
+        // print_hex((u8) ascii_char);
+        append(key_buffer, ascii_char);
+        char str[2] = {ascii_char, 0};  // 构建字符串用于打印
+        kprint(str);
+    }
+
+    port_byte_out(0x20, 0x20);
+    //发送EOI(End of Interrupt，中断结束信号)给主PIC
+    //目的在于表示中断已处理完成
+}
+
+// 命令执行函数
+void user_input(char *input){
+    if(strcmp(input, "exit") == 0){
+        kprint("Stopping the opertion system, Good Bye!\n");
+        __asm__ volatile("hlt");
+    }else if(strcmp(input, "page") == 0){
+        // 这是一个测试命令，用来测试动态内存分配是否还没实现
+        // 实际上我们可以用它来打印当前物理内存位置
+        u32 phys_addr;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(phys_addr));
+        kprint("Page Directory: ");
+        print_hex(phys_addr);
+        kprint("\n");
+    }else if(strcmp(input, "hi") == 0){
+        kprint("Hello, I am the XYTriste operation system.\n");
+    }else if(strcmp(input, "cls") == 0){
+        clean_screen();
+    }else{
+        kprint("The \"");
+        kprint(input);
+        kprint("\" is not an internal or external command,\n not a runnable program or batch file..\n");
+    }
+}
+```
+如此，我们就完成了对于命令的处理。
+> 在编写这段代码的过程中，我遇到了AI无意中留下的几个坑。首先，在keyboard_handler_c中，有关if(scancode >57)的判断，一开始if内执行语句只有一句return;这会导致PIC接收不到0x20的中断处理完成信号，从而一直卡在键盘中断中。其次，由于我们的键盘此时只能处理字符输入，这导致其无法接收到CAPS LOCK这样的大写切换信号，因此也就无法输入大写字符构成的命令。而AI给出的user_input函数中，用于判断是否匹配的命令都是大写的，这导致实际上不能输入任何有效的命令。最后，在page命令下我们尝试打印当前物理地址，但是由于此时我们的操作系统并未开启分页的功能。因此打印出的物理地址始终是00。
+
+然后，我们还实现了对于退格键的处理。上述代码在退格时会删除掉之前输出的内容，直到删除到屏幕上剩下一个命令提示符为止，这是因为我们仅仅只是对屏幕左上角进行了光标位置判断。因此我们更改退格键的逻辑，其实很简单，只要在字符串缓冲区中没有字符的时候就不允许删除，这样就从“删除屏幕上的内容”转变成了“删除当前正在键入的内容”了，修改`keyboard_handler_c`中的退格键处理部分：
+```C
+if(scancode == 0x0E){   // 退格键
+    if(strlen(key_buffer) > 0){
+        backspace(key_buffer);  // 从缓冲区中删除字符
+        kprint_backspace();     // 从视觉上回退光标
+    }  
+}
+```
+这样我们就实现了对于退格键的处理。最后，我们还实现了一个滚动效果，这样在命令行输出内容超出VGA的显存范围的时候，我们就可以把之前的内容刷新掉了。整体思路就是把屏幕上除了第一行以外的内容整体上移一行，然后重新计算光标的位置即可，处理滚动的函数`handle_scrolling`如下:
+```C
+// 处理命令行中内容满时，应该进行滚屏操作
+int handle_scrolling(int cursor_offset){
+    char *video_memory = (char *) VIDEO_MEMORY;
+
+    if(cursor_offset < MAX_COLS * MAX_ROWS * 2){ // 此时还没有到达屏幕下边缘
+        return cursor_offset;
+    }
+
+    // 1.把第i行的内容复制到第i - 1行去
+    for(int i = 1; i < MAX_ROWS; i++){
+        string_copy(
+            (char *)VIDEO_MEMORY + (i * MAX_COLS * 2),
+            (char *)VIDEO_MEMORY + ((i - 1) * MAX_COLS * 2),
+            MAX_COLS * 2
+        );
+    }
+    
+    // 2.清空最后一行
+    char *last_line = video_memory + (MAX_ROWS - 1) * MAX_COLS * 2;
+    for(int i = 0; i < MAX_COLS * 2; i++){
+        // if(i % 2 == 0){
+        //     last_line[i] = ' ';
+        // }else{
+        //     last_line[i] = 0x0f;
+        // }
+        last_line[i] = 0;
+    }
+
+    cursor_offset -= 2 * MAX_COLS; //光标上移一行 
+    return cursor_offset;
+}
+```
+最后，我们在`print_char`函数的末尾，在设置光标位置之前首先检查一下输出是否超出屏幕，超出就先滚动再设置光标位置即可：
+```C
+offset = handle_scrolling(offset);
+set_cursor_offset(offset);
+```
+在这里我还踩了一个很不应该踩的坑，那就是把`handle_scrolling`函数中的第一行写成了:
+```C
+char *video_memory = (u8) VIDEO_MEMORY;
+```
+这导致一个作为地址的`VIDEMO_MEMORY`被转换成了一个8位整数进行处理，导致产生了地址截断，从而不能正确的进行滚动。

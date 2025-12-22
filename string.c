@@ -43,3 +43,10 @@ void backspace(char s[]){
     }
     
 }
+
+// 6. 字符串复制函数(将某个内存地址中的字符串复制到另一内存地址)
+void string_copy(char *source, char *dest, int no_bytes){
+    for(int i = 0; i < no_bytes; i++){
+        *(dest + i) = *(source + i);
+    }
+}

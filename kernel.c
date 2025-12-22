@@ -55,6 +55,7 @@ char keymap[128] = {
     // ... 后面的键先省略，基本够用了 ...
 };
 
+void print_hex32(u32 n);
 void print_hex(u8 n);
 void kprint_at(char *message, int row, int col);
 void port_byte_out(unsigned short port, unsigned char data);
@@ -77,12 +78,18 @@ void keyboard_handler_c();
 void user_input(char *input);
 
 // 引用string.c中的函数
+extern int strlen(char s[]);
 extern int strcmp(char s1[], char s2[]);
 extern void append(char s[], char n);
 extern void backspace(char s[]);
+void string_copy(char *source, char *dest, int no_bytes);
+
+// 处理字符超出命令行界限的函数
+int handle_scrolling(int offset);
 
 // 全局缓冲区，用来存储用户输入的命令
 char key_buffer[256];
+
 
 void main(){
     clean_screen();
@@ -96,6 +103,13 @@ void main(){
     init_keyboard();
     
     while(1);
+}
+
+void print_hex32(u32 n) {
+    print_hex((n >> 24) & 0xFF);
+    print_hex((n >> 16) & 0xFF);
+    print_hex((n >> 8) & 0xFF);
+    print_hex(n & 0xFF);
 }
 
 void print_hex(u8 n) {
@@ -186,6 +200,7 @@ void print_char(char character, int col, int row, char attribute_byte){
         video_memory[offset + 1] = attribute_byte;
         offset += 2;
     }
+    offset = handle_scrolling(offset);
     set_cursor_offset(offset);
 }
 // 打印字符串（对print_char)的封装
@@ -201,7 +216,7 @@ void kprint_backspace(){
     int row = offset / (2 * MAX_COLS);
     int col = (offset / 2) % MAX_COLS;
 
-    if(offset >= 0){
+    if(offset > 0){ // 只有当偏移量大于0的时候才可以删除，要不然会把提示符'>'也给删除掉
         print_char(' ', col, row, 0x0f);
         set_cursor_offset(offset);
     }
@@ -272,7 +287,7 @@ void init_keyboard() {
     // --- 3. 开启中断！---
     // 这就是之前的“危险动作”，现在可以安全执行了
     __asm__ volatile("sti");
-    kprint("Keyboard is init\n");
+    // kprint("Keyboard is init\n");
 }
 
 //  键盘处理函数
@@ -285,11 +300,14 @@ void keyboard_handler_c(){
     // print_hex(scancode);
 
     if(scancode > 57){  // 忽略键盘松开按键和其他无效键
+        port_byte_out(0x20, 0x20);  
         return;
     }
     if(scancode == 0x0E){   // 退格键
-        backspace(key_buffer);  // 从缓冲区中删除字符
-        kprint_backspace();     // 从视觉上回退光标
+        if(strlen(key_buffer) > 0){
+            backspace(key_buffer);  // 从缓冲区中删除字符
+            kprint_backspace();     // 从视觉上回退光标
+        }  
     }else if(scancode == 0x1C){     // 处理回车键
         kprint("\n");
         user_input(key_buffer);
@@ -312,24 +330,56 @@ void keyboard_handler_c(){
 
 // 命令执行函数
 void user_input(char *input){
-    if(strcmp(input, "EXIT") == 0){
+    if(strcmp(input, "exit") == 0){
         kprint("Stopping the opertion system, Good Bye!\n");
         __asm__ volatile("hlt");
-    }else if(strcmp(input, "PAGE") == 0){
+    }else if(strcmp(input, "page") == 0){
         // 这是一个测试命令，用来测试动态内存分配是否还没实现
         // 实际上我们可以用它来打印当前物理内存位置
         u32 phys_addr;
         __asm__ volatile("mov %%cr3, %0" : "=r"(phys_addr));
         kprint("Page Directory: ");
-        print_hex(phys_addr);
+        print_hex32(phys_addr);
         kprint("\n");
-    }else if(strcmp(input, "HI") == 0){
+    }else if(strcmp(input, "hi") == 0){
         kprint("Hello, I am the XYTriste operation system.\n");
-    }else if(strcmp(input, "CLS") == 0){
+    }else if(strcmp(input, "cls") == 0){
         clean_screen();
     }else{
         kprint("The \"");
         kprint(input);
         kprint("\" is not an internal or external command,\n not a runnable program or batch file..\n");
     }
+}
+
+// 处理命令行中内容满时，应该进行滚屏操作
+int handle_scrolling(int cursor_offset){
+    char *video_memory = (char *) VIDEO_MEMORY;
+
+    if(cursor_offset < MAX_COLS * MAX_ROWS * 2){ // 此时还没有到达屏幕下边缘
+        return cursor_offset;
+    }
+
+    // 1.把第i行的内容复制到第i - 1行去
+    for(int i = 1; i < MAX_ROWS; i++){
+        string_copy(
+            (char *)VIDEO_MEMORY + (i * MAX_COLS * 2),
+            (char *)VIDEO_MEMORY + ((i - 1) * MAX_COLS * 2),
+            MAX_COLS * 2
+        );
+    }
+    
+    // 2.清空最后一行
+    char *last_line = video_memory + (MAX_ROWS - 1) * MAX_COLS * 2;
+    for(int i = 0; i < MAX_COLS * 2; i++){
+        // if(i % 2 == 0){
+        //     last_line[i] = ' ';
+        // }else{
+        //     last_line[i] = 0x0f;
+        // }
+        last_line[i] = 0;
+    }
+
+    cursor_offset -= 2 * MAX_COLS;
+    return cursor_offset;
 }
