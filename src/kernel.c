@@ -1,35 +1,7 @@
 // kernel.c
 #include"mem.h"
-//显存配置
-#define VIDEO_MEMORY 0xb8000
-#define MAX_COLS 80
-#define MAX_ROWS 25
-
-// 端口配置（VGA控制端口）
-#define REG_SCREEN_CTRL 0x3d4
-#define REG_SCREEN_DATA 0x3d5
-
-// 键盘端口配置
-#define KEYBOARD_PORT 0x60
-
-typedef struct{
-    u16 low_offset; // 中断处理函数的低16位地址
-    u16 sel;        // 内核段选择子
-    u8 always0;
-
-    // 标志位 byte: 
-    // Bit 7: Present (1)
-    // Bit 5-6: DPL (Privilege) (00)
-    // Bit 0-4: Type (01110 = 32-bit Interrupt Gate)
-    // 所以通常是 0x8E (1 00 0 1110)
-    u8 flags;
-    u16 high_offset; // 中断处理函数的高16位地址
-} __attribute__((packed)) idt_gate_t;
-
-typedef struct{
-    u16 limit;
-    u32 base;
-} __attribute__((packed)) idt_register_t;
+#include "kernel.h"
+#include "paging.h"
 
 #define IDT_ETRIES 256  // IDT表的大小，每个项目占据8字节 
 idt_gate_t idt[IDT_ETRIES];
@@ -50,55 +22,62 @@ char keymap[128] = {
     ' ', /* Space bar */
     // ... 后面的键先省略，基本够用了 ...
 };
-
-void print_hex32(u32 n);
-void print_hex(u8 n);
-void kprint_at(char *message, int row, int col);
-void port_byte_out(unsigned short port, unsigned char data);
-unsigned char port_byte_in(unsigned short port);
-
-int get_cursor_offset();
-void set_cursor_offset(int offset);
-
-void print_char(char character, int col, int row, char attribute_byte);
-void kprint(char *message);
-void clean_screen();
-
-void set_idt_gate(int n, u32 handler);
-void set_idt();
-
-extern void isr_stub();
-void init_keyboard();
-void keyboard_handler_c();
-
-void user_input(char *input);
-
-// 引用string.c中的函数
-extern int strlen(char s[]);
-extern int strcmp(char s1[], char s2[]);
-extern void append(char s[], char n);
-extern void backspace(char s[]);
-void string_copy(char *source, char *dest, int no_bytes);
-
-// 处理字符超出命令行界限的函数
-int handle_scrolling(int offset);
-
 // 全局缓冲区，用来存储用户输入的命令
 char key_buffer[256];
+void debug_paging_status();
 
-
-void main(){
+void _start(){
     clean_screen();
-
-    for(int i = 0; i < IDT_ETRIES; i++){
-        set_idt_gate(i, (u32) isr_stub);
-    }
+    
+    init_interrputs();
+    
+    kprint("Enabling Paging... ");
+    init_paging();
+    debug_paging_status();
+    kprint("Done!\n");
 
     kprint("> ");
-    key_buffer[0] = '\0';
-    init_keyboard();
-    
     while(1);
+}
+
+void debug_paging_status() {
+    u32 cr0, cr3;
+    
+    // 1. 读取 CR0 和 CR3 的当前值
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+
+    kprint("\n--- Paging Diagnostics ---\n");
+    
+    // 2. 检查 PG 位 (Bit 31)
+    kprint("CR0: "); print_hex32(cr0);
+    if (cr0 & 0x80000000) {
+        kprint(" (Paging is ON)\n");
+    } else {
+        kprint(" (Paging is OFF - FAIL!)\n");
+    }
+
+    // 3. 检查 CR3 (页目录地址)
+    kprint("CR3: "); print_hex32(cr3);
+    if ((cr3 & 0xFFF) == 0) {
+        kprint(" (Aligned)\n");
+    } else {
+        kprint(" (NOT Aligned - FAIL!)\n");
+    }
+
+    // 4. 检查非法地址 0x40000000 (1GB) 在页目录里的状态
+    // 1GB 对应的页目录索引是：0x40000000 >> 22 = 256 (0x100)
+    // 我们需要访问 page_directory 数组。但是 page_directory 是局部变量吗？
+    // 如果 page_directory 是全局变量，我们可以直接读。
+    extern u32 *page_directory; 
+    u32 pde = page_directory[256];
+    
+    kprint("PDE[256]: "); print_hex32(pde);
+    if ((pde & 1) == 0) {
+        kprint(" (Not Present - GOOD)\n");
+    } else {
+        kprint(" (Present - FAIL! Why mapped?)\n");
+    }
 }
 
 void print_hex32(u32 n) {
@@ -227,6 +206,13 @@ void clean_screen(){
     set_cursor_offset(0);
 }
 
+void init_interrputs(){
+    for(int i = 0; i < IDT_ETRIES; i++){
+        set_idt_gate(i, (u32) isr_stub);
+    }
+    init_keyboard();
+}
+
 //设置IDT门
 void set_idt_gate(int n, u32 handler){
     // n:中断号，大小从0-255;  handler:函数的地址，32位的数字
@@ -284,6 +270,10 @@ void init_keyboard() {
     // 这就是之前的“危险动作”，现在可以安全执行了
     __asm__ volatile("sti");
     // kprint("Keyboard is init\n");
+    
+    // 4. 初始化键盘缓冲区
+    key_buffer[0] = '\0';
+
 }
 
 //  键盘处理函数
@@ -351,6 +341,16 @@ void user_input(char *input){
         u32 ptr3 = kmalloc(10, 1, 0);
         print_hex32(ptr3);
         kprint("\n");
+    }else if (strcmp(input, "crash") == 0) {
+        kprint("Testing unmapped memory...\n");
+        
+        // 我们只映射了 0-4MB (0x00000000 - 0x003FFFFF)
+        // 让我们尝试访问 1GB 处的一个地址 (0x40000000)
+        u32 *ptr = (u32*)0x40000000;
+        print_hex32(ptr);
+        u32 do_doom = *ptr; // 这一读操作应该触发缺页中断
+        
+        kprint("I survived? This is wrong!\n"); // 如果这行打印了，说明分页没生效
     }else{
         kprint("The \"");
         kprint(input);

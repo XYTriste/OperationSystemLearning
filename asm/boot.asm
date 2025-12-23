@@ -13,7 +13,7 @@
     mov bx, 0x7e00  ;调用约定，读扇区服务使用es:bx作为段:偏移读地址
 
     mov ah, 0x02
-    mov al, 20
+    mov al, 30
 
     mov ch, 0
     mov dh, 0
