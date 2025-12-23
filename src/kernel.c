@@ -1,5 +1,5 @@
 // kernel.c
-
+#include"mem.h"
 //显存配置
 #define VIDEO_MEMORY 0xb8000
 #define MAX_COLS 80
@@ -11,10 +11,6 @@
 
 // 键盘端口配置
 #define KEYBOARD_PORT 0x60
-
-typedef unsigned int u32;
-typedef unsigned short u16;
-typedef unsigned char u8;
 
 typedef struct{
     u16 low_offset; // 中断处理函数的低16位地址
@@ -345,6 +341,16 @@ void user_input(char *input){
         kprint("Hello, I am the XYTriste operation system.\n");
     }else if(strcmp(input, "cls") == 0){
         clean_screen();
+    }else if(strcmp(input, "malloc") == 0){
+        u32 ptr = kmalloc(50, 0, 0);
+        print_hex32(ptr);
+        kprint("\n");
+        u32 ptr2 = kmalloc(50, 0, 0);
+        print_hex32(ptr2);
+        kprint("\n");
+        u32 ptr3 = kmalloc(10, 1, 0);
+        print_hex32(ptr3);
+        kprint("\n");
     }else{
         kprint("The \"");
         kprint(input);
